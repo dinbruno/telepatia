@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Outbox de notificação</title>
+<style>
+  :root {
+    --bg: #fafaf9; --surface: #ffffff; --text: #1c1917; --muted: #57534e;
+    --border: #e7e5e4; --accent: #0f766e; --accent-soft: #ccfbf1; --code: #f5f5f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0c0a09; --surface: #1c1917; --text: #f5f5f4; --muted: #a8a29e;
+      --border: #292524; --accent: #2dd4bf; --accent-soft: #134e4a; --code: #292524;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0c0a09; --surface: #1c1917; --text: #f5f5f4; --muted: #a8a29e;
+    --border: #292524; --accent: #2dd4bf; --accent-soft: #134e4a; --code: #292524;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 16px; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .layout { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+  nav { position: sticky; top: 0; height: 100vh; overflow-y: auto; padding: 24px 16px; border-right: 1px solid var(--border); background: var(--surface); }
+  nav h1 { font-size: 16px; margin: 0 0 4px; }
+  nav p { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+  nav a { display: block; padding: 6px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; font-size: 14px; }
+  nav a:hover { color: var(--text); }
+  nav a.active { background: var(--accent-soft); color: var(--text); font-weight: 600; }
+  main { padding: 32px 40px; max-width: 1100px; min-width: 0; }
+  section { margin-bottom: 56px; }
+  h2 { font-size: 22px; margin: 0 0 8px; }
+  h3 { font-size: 16px; margin: 24px 0 8px; }
+  p.lead { color: var(--muted); margin: 0 0 16px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; overflow-x: auto; }
+  pre.mermaid { margin: 0; text-align: center; background: transparent; }
+  pre.code { background: var(--code); padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 13px; }
+  code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--text); }
+  .changelog h3 { display: flex; gap: 8px; align-items: baseline; }
+  .changelog h4 { margin: 12px 0 4px; font-size: 14px; color: var(--accent); }
+  .changelog ul { margin: 0; padding-left: 20px; }
+  @media (max-width: 800px) {
+    .layout { grid-template-columns: 1fr; }
+    nav { position: sticky; height: auto; display: flex; gap: 4px; overflow-x: auto; padding: 8px 16px; border-right: 0; border-bottom: 1px solid var(--border); z-index: 1; }
+    nav h1, nav p { display: none; }
+    nav a { white-space: nowrap; }
+    main { padding: 24px 16px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav aria-label="Seções">
+    <h1>Outbox de notificação</h1>
+    <p>Espelho visual de <code>specs/SPEC.md</code></p>
+    <a href="#arquitetura">Arquitetura</a>
+    <a href="#endpoints">Endpoints e payload</a>
+    <a href="#recepcao">Recepção (POST)</a>
+    <a href="#worker">Worker</a>
+    <a href="#estados">Estados do outbox</a>
+    <a href="#erros">Tratamento de erros</a>
+    <a href="#modelo">Modelo de dados</a>
+    <a href="#deploy">Docker e hospedagem</a>
+    <a href="#changelog">Changelog</a>
+  </nav>
+  <main>
+    <section id="arquitetura">
+      <h2>Arquitetura</h2>
+      <p class="lead">API e worker saem da mesma imagem. Postgres guarda outbox, master, dead letters e erros; Redis segura a fila BullMQ.</p>
+      <div class="card"><pre class="mermaid">
+flowchart LR
+  client(["Cliente"]) -->|"POST /notifications"| ctrl
+  subgraph api["API - dist/main.js"]
+    ctrl["NotificationsController"] --> svc["NotificationsService"]
+    svc --> repo["OutboxRepository"]
+    filter["AllExceptionsFilter"]
+  end
+  subgraph worker["Worker - dist/worker.js"]
+    wf["WorkerFactory"] --> proc["Processor notifications"]
+  end
+  repo --> pg[("Postgres: notifications")]
+  svc -->|"add job: idempotencyKey"| redis[("Redis + BullMQ: fila notifications")]
+  redis --> wf
+  proc -->|"1. POST"| wh["WEBHOOK_URL"]
+  proc -->|"2. emails.send"| rs["Resend API"]
+  proc -->|"3. master + committed"| pg
+  filter -.->|"error_logs"| pg
+  wf -.->|"error_logs e dead_letters"| pg
+      </pre></div>
+    </section>
+
+    <section id="endpoints">
+      <h2>Endpoints e payload</h2>
+      <p class="lead">Base local <code>http://localhost:3000</code>. Swagger em <code>/docs</code>.</p>
+      <div class="card">
+        <table>
+          <thead><tr><th>Rota</th><th>Função</th><th>Respostas</th></tr></thead>
+          <tbody>
+            <tr><td><code>POST /notifications</code></td><td>Consome o payload, grava outbox e enfileira</td><td>201, 200 (chave repetida), 400, 413, 500</td></tr>
+            <tr><td><code>GET /notifications/:idempotencyKey</code></td><td>Status do outbox</td><td>200, 404</td></tr>
+            <tr><td><code>GET /health</code></td><td>Healthcheck do container</td><td>200</td></tr>
+          </tbody>
+        </table>
+        <h3>Payload de entrada</h3>
+<pre class="code"><code>{
+  "idempotencyKey": "appt-2026-11-12-p123-confirm",
+  "to": "paciente@example.com",
+  "subject": "Consulta confirmada",
+  "body": "Sua consulta foi confirmada para 12/11 às 14h.",
+  "metadata": { "patientId": "p-123", "appointmentId": "a-987", "source": "telepatia" }
+}</code></pre>
+        <h3>Formato de erro</h3>
+<pre class="code"><code>{
+  "statusCode": 400,
+  "error": "Bad Request",
+  "message": ["to must be an email"],
+  "path": "/notifications",
+  "timestamp": "2026-11-11T18:00:00.000Z",
+  "errorId": "0b8f6c1e-3d1a-4c55-9a43-2e7f1f0c9d10"
+}</code></pre>
+      </div>
+    </section>
+
+    <section id="recepcao">
+      <h2>Recepção (POST)</h2>
+      <p class="lead">A recepção só grava a intenção e responde. Nada externo é chamado aqui.</p>
+      <div class="card"><pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as Cliente
+  participant A as API
+  participant DB as Postgres
+  participant Q as BullMQ/Redis
+  C->>A: POST /notifications
+  A->>A: ValidationPipe (whitelist, forbidNonWhitelisted)
+  alt payload inválido
+    A->>DB: INSERT error_logs (http, 400)
+    A-->>C: 400 com errorId
+  else chave nova
+    A->>DB: INSERT outbox_events (pending)
+    A->>Q: add job (jobId = idempotencyKey)
+    A-->>C: 201 pending
+  else chave repetida ou P2002
+    A->>DB: SELECT status
+    A-->>C: 200 com status atual, sem job
+  end
+      </pre></div>
+    </section>
+
+    <section id="worker">
+      <h2>Worker</h2>
+      <p class="lead">Ordem fixa: webhook, Resend, master. Master só é escrito no fim.</p>
+      <div class="card"><pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Q as BullMQ
+  participant W as Worker
+  participant DB as Postgres
+  participant H as Webhook
+  participant R as Resend
+  Q->>W: job idempotencyKey
+  W->>DB: carrega outbox
+  opt status committed
+    W-->>Q: encerra sem efeito
+  end
+  W->>DB: processing, attemptCount + 1
+  W->>H: POST WEBHOOK_URL (timeout 5s)
+  alt fora de 2xx ou timeout
+    W->>DB: step webhook, lastError, INSERT error_logs
+    W-->>Q: falha, retry com backoff
+  end
+  W->>R: emails.send (Idempotency-Key)
+  alt erro da API
+    W->>DB: step resend, lastError, INSERT error_logs
+    W-->>Q: falha, retry com backoff
+  end
+  W->>DB: transação: INSERT master_records e committed
+  W-->>Q: concluído
+  Note over Q,DB: Na 5a falha: outbox failed e INSERT dead_letters
+      </pre></div>
+    </section>
+
+    <section id="estados">
+      <h2>Estados do outbox</h2>
+      <div class="card"><pre class="mermaid">
+stateDiagram-v2
+  [*] --> pending: POST 201
+  pending --> processing: worker pega o job
+  processing --> processing: falha webhook ou resend, retry
+  processing --> committed: master gravado
+  processing --> failed: 5 tentativas esgotadas
+  committed --> [*]
+  failed --> [*]
+      </pre></div>
+    </section>
+
+    <section id="erros">
+      <h2>Tratamento de erros</h2>
+      <p class="lead">Todo erro vai para <code>error_logs</code> no mesmo Postgres. Falha ao gravar o log nunca muda a resposta nem o job.</p>
+      <div class="card"><pre class="mermaid">
+flowchart LR
+  e["Exceção"] --> o{"Origem"}
+  o -->|"HTTP"| f["AllExceptionsFilter"]
+  o -->|"Worker"| wf["WorkerFactory"]
+  f --> ins["INSERT error_logs"]
+  wf --> ins
+  ins -->|"ok"| r["Resposta com errorId ou retry do job"]
+  ins -->|"falha"| s["Log em stdout, errorId nulo, status original"]
+  wf -->|"última tentativa"| dl["INSERT dead_letters e outbox failed"]
+      </pre></div>
+    </section>
+
+    <section id="modelo">
+      <h2>Modelo de dados</h2>
+      <p class="lead">Um Postgres, quatro tabelas. A ligação é lógica pelo <code>idempotencyKey</code>, sem FK.</p>
+      <div class="card"><pre class="mermaid">
+erDiagram
+  outbox_events ||--o| master_records : "idempotencyKey"
+  outbox_events ||--o{ dead_letters : "idempotencyKey"
+  outbox_events ||--o{ error_logs : "idempotencyKey opcional"
+  outbox_events {
+    uuid id PK
+    string idempotencyKey UK
+    json payload
+    string status
+    string step
+    int attemptCount
+    string lastError
+    timestamp createdAt
+    timestamp updatedAt
+  }
+  master_records {
+    uuid id PK
+    string idempotencyKey UK
+    json payload
+    timestamp createdAt
+  }
+  dead_letters {
+    uuid id PK
+    string name
+    string idempotencyKey
+    string step
+    string error
+    json payload
+    timestamp createdAt
+  }
+  error_logs {
+    uuid id PK
+    string source
+    string idempotencyKey
+    string step
+    int statusCode
+    string message
+    string stack
+    json context
+    timestamp createdAt
+  }
+      </pre></div>
+    </section>
+
+    <section id="deploy">
+      <h2>Docker e hospedagem</h2>
+      <p class="lead">Uma imagem multi-stage, dois serviços. Só a API migra e tem healthcheck.</p>
+      <div class="card"><pre class="mermaid">
+flowchart TB
+  df["Dockerfile multi-stage, node:24-alpine, usuário node"] --> img["Imagem"]
+  img --> api["api: prisma migrate deploy + node dist/main.js, PORT, HEALTHCHECK /health"]
+  img --> wk["worker: node dist/worker.js"]
+  api --> pg[("Postgres")]
+  api --> rd[("Redis")]
+  wk --> pg
+  wk --> rd
+  wk --> ext["WEBHOOK_URL e Resend"]
+      </pre></div>
+    </section>
+
+    <section id="changelog" class="changelog">
+      <h2>Changelog</h2>
+      <p class="lead">Espelho de <code>specs/CHANGELOG.md</code>. Toda mudança atualiza os dois no mesmo commit.</p>
+      <div class="card">
+        <h3>[Unreleased]</h3>
+        <p>Sem mudanças.</p>
+
+        <h3>[0.1.0] <span class="tag">2026-11-11</span></h3>
+        <p>Refinamento da spec. Nenhum código de produção alterado.</p>
+        <h4>Added</h4>
+        <ul>
+          <li>Payload de entrada: exemplo JSON, tabela do DTO com limites, <code>whitelist</code>/<code>forbidNonWhitelisted</code> e corpo até 100kb.</li>
+          <li><code>POST /notifications</code> como endpoint de consumo, com tabela de status, exemplo <code>curl</code> e tratamento da corrida <code>P2002</code>.</li>
+          <li><code>GET /notifications/:idempotencyKey</code> e <code>GET /health</code>.</li>
+          <li>Formato de erro padrão com <code>errorId</code>.</li>
+          <li><code>AllExceptionsFilter</code> global e <code>ErrorLogRepository</code>; erros da API e do worker no mesmo Postgres.</li>
+          <li>Tabela <code>error_logs</code>; campo <code>name</code> em <code>dead_letters</code>.</li>
+          <li>Dockerfile multi-stage em Node 24, usuário <code>node</code>, <code>HEALTHCHECK</code>, migração no boot da API; <code>.dockerignore</code>.</li>
+          <li>Serviços <code>api</code> e <code>worker</code> no <code>docker-compose.yml</code>; seção de hospedagem.</li>
+          <li>Worker: entrada <code>src/worker.ts</code>, <code>jobId</code> igual à chave, timeout de 5s, corpo do webhook.</li>
+          <li>Testes obrigatórios de <code>error_logs</code>, <code>P2002</code>, campo desconhecido, <code>GET</code> de status e <code>/health</code>.</li>
+          <li>Regra de changelog, este HTML e <code>specs/CHANGELOG.md</code>.</li>
+        </ul>
+        <h4>Changed</h4>
+        <ul>
+          <li><code>SPEC.md</code> movido para <code>specs/SPEC.md</code>.</li>
+          <li>Decisões fechadas: quatro tabelas; Dockerfile obrigatório.</li>
+          <li>Stack: variáveis <code>PORT</code>, <code>OBSERVE_APP_KEY</code>, <code>OBSERVE_APP_SECRET</code>.</li>
+          <li>Scripts <code>start:prod</code> com <code>dist/main.js</code> e <code>start:worker</code>.</li>
+          <li><code>AGENTS.md</code>: regra de changelog obrigatório.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+</div>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs';
+  const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({ startOnLoad: false, theme: dark ? 'dark' : 'default', securityLevel: 'strict' });
+  await mermaid.run({ querySelector: 'pre.mermaid' });
+
+  const links = [...document.querySelectorAll('nav a')];
+  const byId = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+  const observer = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      links.forEach(a => a.classList.remove('active'));
+      byId.get(e.target.id)?.classList.add('active');
+    }
+  }, { rootMargin: '0px 0px -70% 0px' });
+  document.querySelectorAll('main section').forEach(s => observer.observe(s));
+</script>
+</body>
+</html>
