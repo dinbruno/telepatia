@@ -1,126 +1,129 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Outbox de notificação
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Serviço NestJS que aceita um payload, grava a intenção num outbox e só persiste no master depois que o webhook e o e-mail concluem. API e worker saem da mesma imagem. O Postgres guarda outbox, master, dead letters e erros. O Redis segura a fila BullMQ.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+Spec em `0.1.0` (2026-11-11). Essa versão fecha o desenho e não altera código de produção: o que está em `src/` ainda é o scaffold. Os comandos de compose, worker, Prisma e Jest abaixo são os da spec e passam a valer na implementação.
 
-## Description
+## Documentos
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+| arquivo | papel |
+| --- | --- |
+| [specs/SPEC.md](specs/SPEC.md) | fonte de verdade |
+| [specs/architecture.html](specs/architecture.html) | diagramas Mermaid (arquitetura, recepção, worker, estados, erros, modelo, deploy) e changelog. Abrir no navegador |
+| [specs/CHANGELOG.md](specs/CHANGELOG.md) | histórico. Toda mudança entra em `[Unreleased]` no mesmo commit e é espelhada no HTML |
 
-## Project setup
+## Fluxo
 
-```bash
-$ pnpm install
+1. `POST /notifications` valida o payload, grava `outbox_events` com status `pending` e enfileira um job. A mesma `idempotencyKey` responde `200` com o status atual e não enfileira de novo. Corrida com `P2002` tem o mesmo efeito.
+2. O worker (`src/worker.ts`) lê a fila `notifications` e executa, nesta ordem: webhook (`WEBHOOK_URL`, timeout de 5s), e-mail via Resend, gravação de `master_records` com o outbox em `committed`.
+3. Falha no webhook, no Resend ou no master deixa o master intocado. O BullMQ tenta 5 vezes, com backoff exponencial a partir de 1s. Na última, o outbox vai para `failed` e nasce uma linha em `dead_letters`.
+4. Toda resposta HTTP `>= 400` e toda falha do worker grava `error_logs`. O `errorId` da resposta é o `id` dessa linha.
+
+Estados do outbox: `pending` → `processing` → `committed` ou `failed`.
+
+## Endpoints
+
+Base local: `http://localhost:3000`. Swagger em `GET /docs`.
+
+| rota | função | respostas |
+| --- | --- | --- |
+| `POST /notifications` | grava o outbox e enfileira | 201, 200 (chave repetida), 400, 413, 500 |
+| `GET /notifications/:idempotencyKey` | status do outbox | 200, 404 |
+| `GET /health` | healthcheck do container | 200 `{ "status": "ok" }` |
+
+Corpo máximo de 100kb. Campo desconhecido é `400` (`whitelist` e `forbidNonWhitelisted`).
+
+```json
+{
+  "idempotencyKey": "appt-2026-11-12-p123-confirm",
+  "to": "paciente@example.com",
+  "subject": "Consulta confirmada",
+  "body": "Sua consulta foi confirmada para 12/11 às 14h.",
+  "metadata": {
+    "patientId": "p-123",
+    "appointmentId": "a-987",
+    "source": "telepatia"
+  }
+}
 ```
 
-## Compile and run the project
+`idempotencyKey`: obrigatória, até 128 caracteres, `^[A-Za-z0-9._:-]+$`. `to` é e-mail. `subject` até 200 caracteres. `body` até 10000. `metadata` é opcional, no máximo 20 chaves string.
 
-```bash
-# development
-$ pnpm run start
+Erro padrão, gerado pelo `AllExceptionsFilter`:
 
-# watch mode
-$ pnpm run start:dev
-
-# production mode
-$ pnpm run start:prod
+```json
+{
+  "statusCode": 400,
+  "error": "Bad Request",
+  "message": ["to must be an email"],
+  "path": "/notifications",
+  "timestamp": "2026-11-11T18:00:00.000Z",
+  "errorId": "0b8f6c1e-3d1a-4c55-9a43-2e7f1f0c9d10"
+}
 ```
 
-## Run tests
+Em `500`, `message` é `"Internal server error"`. Stack fica em `error_logs` e no stdout.
 
-```bash
-# unit tests
-$ pnpm run test
+## Stack
 
-# e2e tests
-$ pnpm run test:e2e
+NestJS 12 (controller, service, repository), Prisma, `class-validator`, `@nestjs/swagger`, BullMQ, Redis 7, SDK `resend`, Jest com `ts-jest`, Node 24 na imagem.
 
-# test coverage
-$ pnpm run test:cov
+Postgres 16, database `notifications`, quatro tabelas: `outbox_events`, `master_records`, `dead_letters`, `error_logs`. A ligação entre elas é a `idempotencyKey`, sem foreign key.
+
+## Variáveis
+
+Copiar `.env.example` para `.env` na raiz. Não sobrescrever um `.env` que já exista.
+
+| nome | uso |
+| --- | --- |
+| `DATABASE_URL` | Postgres |
+| `REDIS_HOST`, `REDIS_PORT` | Redis da fila |
+| `WEBHOOK_URL` | destino do passo 1 do worker |
+| `RESEND_API_KEY`, `RESEND_FROM` | e-mail |
+| `PORT` | porta da API, padrão `3000` |
+| `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET` | opcionais, NestJS Observe |
+
+## Como rodar
+
+Na raiz do repositório, com Docker no ar.
+
+Infra só para desenvolvimento e testes de integração:
+
+```powershell
+docker compose up -d postgres redis
+pnpm install
+pnpm start:dev
 ```
 
-## Deployment
+Worker, noutro terminal, depois do build:
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ pnpm install -g @nestjs/mau
-$ mau deploy
+```powershell
+pnpm build
+pnpm start:worker
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+Stack completa (API e worker na mesma imagem; só a API roda `prisma migrate deploy` e responde `/health`):
 
-## Observability
-
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
-
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
-
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
-
-This project is already instrumented. To connect it, run this and approve the code it prints at [observe.nestjs.com/link](https://observe.nestjs.com/link) - signing up for free if you have no account:
-
-```bash
-$ npx @nestjs/observe link
+```powershell
+docker compose up -d --build
 ```
 
-It writes the app key and secret into `.env` and makes every `nest start` script (`start`, `start:dev`, `start:debug`) load it. In production, set `OBSERVE_APP_KEY` and `OBSERVE_APP_SECRET` in the environment instead.
+Exemplo de recepção:
 
-Or do it by hand: create an application and an API key at [observe.nestjs.com](https://observe.nestjs.com), and set the pair as `OBSERVE_APP_KEY` and `OBSERVE_APP_SECRET` in the environment the app runs in.
+```powershell
+curl.exe -i -X POST http://localhost:3000/notifications -H "Content-Type: application/json" -d "{\"idempotencyKey\":\"appt-2026-11-12-p123-confirm\",\"to\":\"paciente@example.com\",\"subject\":\"Consulta confirmada\",\"body\":\"Sua consulta foi confirmada.\"}"
+```
 
-The free plan needs no payment details and covers 300,000 events a month. You can also browse the [live demo](https://www.observe-demo.nestjs.com/dashboard) first - the whole dashboard over a busy service's data, with nothing to install.
+Na hospedagem, a plataforma constrói o `Dockerfile` e sobe dois serviços da mesma imagem. A API usa o `CMD` padrão. O worker usa `node dist/worker.js`. Postgres e Redis gerenciados entram pelas variáveis acima.
 
-## Resources
+## Testes
 
-Check out a few resources that may come in handy when working with NestJS:
+Jest no lugar do Vitest. Unitários mockam Prisma, HTTP, Resend e Redis. E2E sobe com Postgres e Redis do compose e mocka webhook e Resend na borda.
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observe](https://observe.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+```powershell
+pnpm test
+pnpm test:e2e
+pnpm test:cov
+```
 
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+Pronto quando `pnpm test` e `pnpm test:e2e` estão verdes, o compose de Postgres e Redis está de pé, `docker build .` conclui e o container da API responde `GET /health`. A lista de casos está em `specs/SPEC.md`, seção Testes obrigatórios.

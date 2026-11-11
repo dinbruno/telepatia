@@ -5,6 +5,10 @@ Regra: toda mudança entra em `[Unreleased]` no mesmo commit e é espelhada em `
 
 ## [Unreleased]
 
+### Changed
+
+- `README.md`: descreve o outbox (fluxo, endpoints, variáveis, Docker e testes) a partir de `specs/SPEC.md`, `specs/architecture.html` e `specs/CHANGELOG.md`.
+
 ## [0.1.0] - 2026-11-11
 
 Refinamento da spec. Nenhum código de produção alterado.
